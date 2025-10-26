@@ -1,0 +1,9 @@
+vllm
+nnsight
+torch
+matplotlib
+numpy
+ipykernel
+openai
+transformers
+hf_transfer
