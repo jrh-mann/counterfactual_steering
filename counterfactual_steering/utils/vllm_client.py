@@ -5,6 +5,7 @@ from openai import OpenAI, AsyncOpenAI
 import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
+import re
 
 
 class VLLMClient:
@@ -409,6 +410,177 @@ class VLLMClient:
         
         await async_client.close()
         return results
+    
+    def generate_raw(
+        self,
+        prompts: List[str],
+        model: Optional[str] = None,
+        max_tokens: int = 100,
+        temperature: float = 0.7,
+        max_workers: int = 10,
+        return_full_response: bool = False,
+        prefill: Optional[str] = None,
+        **kwargs
+    ) -> List[Any]:
+        """
+        Generate completions using raw prompts (bypasses chat templates).
+        This gives you full control over the prompt format, including reasoning structure.
+        
+        Args:
+            prompts: List of input prompts (full prompt text, not just user messages)
+            model: Model name (if None, will auto-detect from server)
+            max_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            max_workers: Maximum number of parallel workers
+            return_full_response: If True, returns full response dict with all metadata
+            prefill: Optional text to prefill (will be appended to prompt before generation)
+            **kwargs: Additional arguments to pass to the API
+            
+        Returns:
+            List of generated text completions (str) or full response dicts if return_full_response=True
+            
+        Example:
+            # Create a raw prompt with reasoning structure for gpt-oss-20b
+            prompt = "User: What is 2+2?\nAssistant: <reasoning>\nLet me think about this..."
+            prefill = "The answer is obviously"
+            result = client.generate_raw([prompt], prefill=prefill, max_tokens=100)
+        """
+        if not prompts:
+            return []
+        
+        # Auto-detect model if not provided
+        if model is None:
+            model = self.get_default_model()
+        
+        def _generate_single(prompt: str) -> Any:
+            """Generate completion for a single raw prompt."""
+            # Append prefill to prompt if provided
+            full_prompt = prompt
+            if prefill:
+                full_prompt = prompt + prefill
+            
+            # Use completions endpoint (not chat.completions) to bypass chat templates
+            request_params = {
+                "model": model,
+                "prompt": full_prompt,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                **kwargs
+            }
+            
+            # Use the completions endpoint for raw prompt control
+            response = self.client.completions.create(**request_params)
+            
+            if return_full_response:
+                completion_text = response.choices[0].text or ""
+                prefill_text = prefill if prefill else ""
+                
+                # Try to extract reasoning from completion text for models like gpt-oss-20b
+                # The completion continues from where the prompt left off (after <|channel|>analysis<|message|>reasoning_prefill)
+                # So completion_text may contain: more_reasoning + possibly <|channel|>final<|message|>final_answer
+                
+                # First, extract any reasoning prefill from the prompt
+                reasoning_prefill_from_prompt = ""
+                if "<|channel|>analysis<|message|>" in prompt:
+                    # Extract text after the analysis marker in the prompt (this is the prefill)
+                    prompt_parts = prompt.split("<|channel|>analysis<|message|>")
+                    if len(prompt_parts) > 1:
+                        reasoning_prefill_from_prompt = prompt_parts[1]
+                
+                # Parse the completion to separate reasoning continuation from final answer
+                # Note: Special tokens like <|channel|>final<|message|> may be decoded/stripped by vLLM
+                # and appear as "assistantfinal" in the text, so we need to handle both cases
+                reasoning_continuation = None
+                final_answer = None
+                
+                # Try multiple patterns for finding the final answer marker
+                # 1. Proper channel marker
+                if "<|channel|>final<|message|>" in completion_text:
+                    parts = completion_text.split("<|channel|>final<|message|>")
+                    reasoning_continuation = parts[0]
+                    final_answer = parts[1] if len(parts) > 1 else ""
+                # 2. Decoded/stripped special token appearing as "assistantfinal"
+                elif "assistantfinal" in completion_text.lower():
+                    # Find the first occurrence (should only be one, but be safe)
+                    # Use case-insensitive search to find where to split
+                    match = re.search(r'assistantfinal', completion_text, flags=re.IGNORECASE)
+                    if match:
+                        split_idx = match.start()
+                        reasoning_continuation = completion_text[:split_idx]
+                        final_answer = completion_text[match.end():] if match.end() < len(completion_text) else ""
+                    else:
+                        # Fallback: use split
+                        parts = re.split(r'assistantfinal', completion_text, flags=re.IGNORECASE, maxsplit=1)
+                        reasoning_continuation = parts[0]
+                        final_answer = parts[1] if len(parts) > 1 else ""
+                # 3. Other channel markers
+                elif "<|channel|>" in completion_text:
+                    next_channel_idx = completion_text.find("<|channel|>")
+                    reasoning_continuation = completion_text[:next_channel_idx]
+                    final_answer = completion_text[next_channel_idx:]
+                # 4. No markers found - all reasoning
+                else:
+                    reasoning_continuation = completion_text
+                    final_answer = None
+                
+                # Combine prefill with continuation to get full reasoning
+                if reasoning_prefill_from_prompt:
+                    reasoning_text = reasoning_prefill_from_prompt + reasoning_continuation
+                else:
+                    reasoning_text = reasoning_continuation
+                
+                # Final cleanup: ensure reasoning doesn't contain "assistantfinal" (shouldn't happen, but be safe)
+                if reasoning_text and "assistantfinal" in reasoning_text.lower():
+                    # Remove everything from "assistantfinal" onwards from reasoning
+                    match = re.search(r'assistantfinal', reasoning_text, flags=re.IGNORECASE)
+                    if match:
+                        reasoning_text = reasoning_text[:match.start()]
+                
+                result = {
+                    "prompt": prompt,
+                    "prefill": prefill if prefill else None,
+                    "completion": final_answer if final_answer is not None else completion_text,
+                    "reasoning": reasoning_text,
+                    "full_text": prefill_text + completion_text,
+                    "model": response.model,
+                    "finish_reason": response.choices[0].finish_reason,
+                    "usage": {
+                        "prompt_tokens": response.usage.prompt_tokens if response.usage else 0,
+                        "completion_tokens": response.usage.completion_tokens if response.usage else 0,
+                        "total_tokens": response.usage.total_tokens if response.usage else 0,
+                    }
+                }
+                
+                # Include additional fields if present
+                if hasattr(response.choices[0], 'logprobs') and response.choices[0].logprobs:
+                    result["logprobs"] = response.choices[0].logprobs
+                
+                result["raw_response"] = response.model_dump() if hasattr(response, 'model_dump') else None
+                
+                return result
+            else:
+                # Return full text (prefill + completion) if prefill was used
+                completion_text = response.choices[0].text or ""
+                if prefill:
+                    return prefill + completion_text
+                return completion_text
+        
+        # Process prompts in parallel using ThreadPoolExecutor
+        responses = [None] * len(prompts)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_idx = {
+                executor.submit(_generate_single, prompt): idx 
+                for idx, prompt in enumerate(prompts)
+            }
+            
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    responses[idx] = future.result()
+                except Exception as e:
+                    responses[idx] = f"Error: {str(e)}"
+        
+        return responses
 
 
 def format_prompt(task: str, rules: str, grader: str) -> str:
@@ -460,37 +632,3 @@ def format_prompts_from_dicts(prompt_dicts: List[Dict[str, str]]) -> List[str]:
     graders = [d["grader"] for d in prompt_dicts]
     
     return format_prompts_batch(tasks, rules, graders)
-
-
-if __name__ == "__main__":
-    # Example usage
-    client = VLLMClient()
-    
-    # Batch query example
-    prompts = [
-        "What is the capital of France?",
-        "Explain quantum computing in one sentence.",
-        "What is 2+2?"
-    ]
-    
-    print("Generating completions with parallel processing...")
-    start_time = time.time()
-    completions = client.generate(prompts, max_tokens=50, temperature=0.7, max_workers=3)
-    elapsed = time.time() - start_time
-    
-    print(f"\nProcessed {len(prompts)} prompts in {elapsed:.2f} seconds")
-    for prompt, completion in zip(prompts, completions):
-        print(f"\nPrompt: {prompt}")
-        print(f"Completion: {completion}")
-    
-    # Example with format_prompts_batch
-    print("\n" + "="*50)
-    print("Example with format_prompts_batch:")
-    
-    tasks = ["Task 1", "Task 2"]
-    rules = ["Rule 1", "Rule 2"]
-    graders = ["Grader 1", "Grader 2"]
-    
-    formatted = format_prompts_batch(tasks, rules, graders)
-    print(f"Formatted {len(formatted)} prompts")
-
