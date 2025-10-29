@@ -7,3 +7,5 @@ ipykernel
 openai
 transformers
 hf_transfer
+scikit-learn
+dictionary_learning
