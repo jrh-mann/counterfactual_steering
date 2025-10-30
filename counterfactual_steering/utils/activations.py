@@ -32,13 +32,13 @@ def store_activations(model, prompts, output_dir):
     with torch.no_grad():
         for index, prompt in enumerate(tqdm(prompts)):
             residual_stream = []
-            start_of_response = get_start_of_sublist(model.tokenizer, prompt)
+            #start_of_response = get_start_of_sublist(model.tokenizer, prompt)
             with model.trace(prompt) as gen:
                 for layer in model.model.layers:
                     residual_stream.append(layer.output.save()[0])
             acts = torch.stack(residual_stream)
-            indexed_acts = acts[:,start_of_response:]
-            cpuacts = indexed_acts.cpu()
+            #indexed_acts = acts[:,start_of_response:]
+            cpuacts = acts.cpu()
             torch.save(cpuacts, output_dir + f"/{index}.pt")
 
             del residual_stream
