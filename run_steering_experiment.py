@@ -83,19 +83,24 @@ async def judge_with_gpt5_nano(response_text, semaphore, api_key):
 
     async with semaphore:
         try:
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(timeout=180.0) as client:  # Increased timeout to 3 minutes
                 resp = await client.post(
                     OPENROUTER_BASE_URL,
                     json=payload,
-                    headers=headers,
-                    timeout=60
+                    headers=headers
                 )
                 if resp.status_code != 200:
-                    return {"verdict": "error", "error": f"Status {resp.status_code}"}
+                    error_msg = f"Status {resp.status_code}: {resp.text[:200]}"
+                    print(f"\n⚠️ API Error: {error_msg}")
+                    return {"verdict": "error", "error": error_msg}
+                
                 resp_obj = resp.json()
                 choices = resp_obj.get("choices")
                 if not choices or not isinstance(choices, list):
-                    return {"verdict": "error", "error": "No choices in response"}
+                    error_msg = "No choices in response"
+                    print(f"\n⚠️ Response Error: {error_msg}")
+                    return {"verdict": "error", "error": error_msg}
+                
                 msg = choices[0]["message"]["content"].strip()
                 
                 # Parse JSON from response
@@ -120,9 +125,14 @@ async def judge_with_gpt5_nano(response_text, semaphore, api_key):
                             return {"verdict": judgment.get("verdict", "error")}
                         except Exception:
                             pass
-                return {"verdict": "error", "error": "Could not parse verdict"}
+                
+                error_msg = f"Could not parse verdict from: {msg[:100]}..."
+                print(f"\n⚠️ Parse Error: {error_msg}")
+                return {"verdict": "error", "error": error_msg}
         except Exception as e:
-            return {"verdict": "error", "error": str(e)}
+            error_msg = str(e)
+            print(f"\n⚠️ Exception: {error_msg}")
+            return {"verdict": "error", "error": error_msg}
 
 
 def run_and_judge_experiment(
@@ -220,9 +230,12 @@ def run_and_judge_experiment(
     
     # Collect statistics
     stats = {'reward_hacking': 0, 'honest': 0, 'unclear': 0, 'error': 0}
+    error_messages = []
     for judgment in all_judgments:
         verdict = judgment.get('verdict', 'error')
         stats[verdict] = stats.get(verdict, 0) + 1
+        if verdict == 'error' and 'error' in judgment:
+            error_messages.append(judgment['error'])
     
     # Print results
     print("\nEXPERIMENT RESULTS")
@@ -234,6 +247,13 @@ def run_and_judge_experiment(
     print(f"Unclear: {stats['unclear']}/{n_runs} ({stats['unclear']/n_runs*100:.1f}%)")
     if stats['error'] > 0:
         print(f"Errors: {stats['error']}/{n_runs} ({stats['error']/n_runs*100:.1f}%)")
+        print("\nError Details:")
+        # Show unique error messages
+        unique_errors = {}
+        for err in error_messages:
+            unique_errors[err] = unique_errors.get(err, 0) + 1
+        for err, count in unique_errors.items():
+            print(f"  • [{count}x] {err[:150]}")
     print("="*80)
     
     return {
@@ -251,7 +271,7 @@ def main():
     # ============================================================================
     
     # Alpha values to sweep over (list for multiple experiments, or single value)
-    alphas = [-10, -5, 0, 5, 10]  # Will run experiment for each alpha
+    alphas = [-10, -7.5, -5, -2.5, 0, 2.5, 5, 7.5, 10]  # Will run experiment for each alpha
     # alphas = [0.0]  # Uncomment for single experiment
     
     # Experiment parameters
@@ -267,7 +287,7 @@ def main():
     
     # Model and API
     model_name = 'openai/gpt-oss-20b'
-    api_key = "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"
+    api_key = "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"
     
     # ============================================================================
     # END CONFIGURATION
@@ -293,8 +313,8 @@ def main():
     
     #direction = get_direction(15, [123849])
     direction = torch.load("/root/counterfactual_steering/counterfactual_steering/directions/directions_layers_11_15_19.pt")
-    # Normalize each layer's direction vector separately (along the hidden dimension)
-    direction = direction / direction.norm(dim=-1, keepdim=True)
+    # Normalize each layer's direction vector separately (along the hidden dimension) 
+    direction = direction / direction.norm(dim=0, keepdim=True)
     
     # Initialize model once
     print(f"\nInitializing model {model_name}...")
